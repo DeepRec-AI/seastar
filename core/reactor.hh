@@ -27,6 +27,7 @@
 #include "aligned_buffer.hh"
 #include "cacheline.hh"
 #include "circular_buffer_fixed_capacity.hh"
+#include "packet_queue.hh"
 #include <memory>
 #include <type_traits>
 #include <libaio.h>
@@ -60,7 +61,6 @@
 #include "posix.hh"
 #include "apply.hh"
 #include "sstring.hh"
-#include "deleter.hh"
 #include "net/api.hh"
 #include "temporary_buffer.hh"
 #include "circular_buffer.hh"
@@ -70,6 +70,7 @@
 #include "core/scattered_message.hh"
 #include "core/enum.hh"
 #include "core/memory.hh"
+#include "core/channel.hh"
 #include <boost/range/irange.hpp>
 #include "timer.hh"
 #include "condition-variable.hh"
@@ -78,6 +79,7 @@
 #include "manual_clock.hh"
 #include "core/metrics_registration.hh"
 #include "scheduling.hh"
+#include "posix.hh"
 
 #ifdef HAVE_OSV
 #include <osv/sched.hh>
@@ -92,10 +94,16 @@ namespace seastar {
 
 using shard_id = unsigned;
 
+namespace alien {
+class message_queue;
+}
 
 class reactor;
 class pollable_fd;
 class pollable_fd_state;
+namespace net {
+class posix_data_sink_impl;
+}
 
 class pollable_fd_state {
 public:
@@ -160,6 +168,7 @@ protected:
     friend class reactor;
     friend class readable_eventfd;
     friend class writeable_eventfd;
+    friend class net::posix_data_sink_impl;
 private:
     std::unique_ptr<pollable_fd_state> _s;
 };
@@ -310,8 +319,8 @@ class smp_message_queue {
     };
     // keep this between two structures with statistics
     // this makes sure that they have at least one cache line
-    // between them, so hw prefecther will not accidentally prefetch
-    // cache line used by aother cpu.
+    // between them, so hw prefetcher will not accidentally prefetch
+    // cache line used by another cpu.
     metrics::metric_groups _metrics;
     struct alignas(seastar::cache_line_size) {
         size_t _received = 0;
@@ -367,6 +376,7 @@ class smp_message_queue {
     std::vector<work_item*> _completed_fifo;
 public:
     smp_message_queue(reactor* from, reactor* to);
+    ~smp_message_queue();
     template <typename Func>
     futurize_t<std::result_of_t<Func()>> submit(Func&& func) {
         auto wi = std::make_unique<async_work_item<Func>>(std::forward<Func>(func));
@@ -460,6 +470,9 @@ public:
     virtual future<> notified(reactor_notifier *n) = 0;
     // Methods for allowing sending notifications events between threads.
     virtual std::unique_ptr<reactor_notifier> make_reactor_notifier() = 0;
+
+    // return file fd
+    virtual int get_fd() = 0;
 };
 
 // reactor backend using file-descriptor & epoll, suitable for running on
@@ -486,6 +499,7 @@ public:
     virtual std::unique_ptr<reactor_notifier> make_reactor_notifier() override;
     void abort_reader(pollable_fd_state& fd, std::exception_ptr ex);
     void abort_writer(pollable_fd_state& fd, std::exception_ptr ex);
+    int get_fd() override;
 };
 
 #ifdef HAVE_OSV
@@ -510,6 +524,7 @@ public:
     virtual std::unique_ptr<reactor_notifier> make_reactor_notifier() override;
     void enable_timer(steady_clock_type::time_point when);
     friend class reactor_notifier_osv;
+    int get_fd() override;
 };
 #endif /* HAVE_OSV */
 
@@ -609,7 +624,9 @@ private:
     class signal_pollfn;
     class aio_batch_submit_pollfn;
     class batch_flush_pollfn;
+    class packet_queue_pollfn;
     class smp_pollfn;
+    class smp_alien_pollfn;
     class drain_cross_cpu_freelist_pollfn;
     class lowres_timer_pollfn;
     class manual_timer_pollfn;
@@ -620,7 +637,9 @@ private:
     friend signal_pollfn;
     friend aio_batch_submit_pollfn;
     friend batch_flush_pollfn;
+    friend packet_queue_pollfn;
     friend smp_pollfn;
+    friend smp_alien_pollfn;
     friend drain_cross_cpu_freelist_pollfn;
     friend lowres_timer_pollfn;
     friend class manual_clock;
@@ -749,6 +768,8 @@ private:
     int64_t _last_vruntime = 0;
     task_queue_list _active_task_queues;
     task_queue_list _activating_task_queues;
+    packet_queue* _packet_queue;
+
     task_queue* _at_destroy_tasks;
     sched_clock::duration _task_quota;
     /// Handler that will be called when there is no task to execute on cpu.
@@ -940,6 +961,57 @@ public:
         }
     }
 
+    packet_queue* get_packet_queue() {
+        return _packet_queue;
+    }
+
+    future<> flush_packet_queue(bool& pollable) {
+        pollable = false;
+
+        user_packet* item = nullptr;
+        if (!_packet_queue->try_dequeue_bulk(&item)) {
+          return make_ready_future();
+        }
+        channel* chan = item->_channel;
+
+        pollable = true;
+        output_stream<char>* out = chan->get_output_stream();
+
+        return out->write(net::packet(item->_fragments,
+                                      make_deleter(seastar::deleter(), [item](){
+                                        item->_done();
+                                        delete item;
+                                      })
+              )).then([this, out]() {
+            return out->flush().then([] {
+                return seastar::make_ready_future<>();  
+            });
+        }).then_wrapped([this, out, chan] (auto&& f) {
+            try {
+                f.get();
+                return seastar::make_ready_future<>();
+            } catch (...) {
+                // disconnect when exception
+                std::cerr << "Write error, disconnect the connection." << std::endl;
+                chan->set_channel_broken();
+
+                // ev_del is a param that will be ignored by EPOLL_CTL_DEL
+                // so the last param in epoll_ctl can be null, but
+                // in kernel versions before 2.6.9, the EPOLL_CTL_DEL operation required
+                // a non-null pointer in event, even though this argument is ignored.
+                // so we use a empty param here.
+                struct epoll_event ev_del;
+                if (epoll_ctl(_backend.get_fd(), EPOLL_CTL_DEL, out->get_fd(), &ev_del) < 0) {
+                    std::cerr << "Epoll delete fd error." << std::endl;
+                    return make_ready_future();
+                }
+                close(out->get_fd());
+
+                return make_ready_future();
+            }
+        });
+    }
+
     /// Set a handler that will be called when there is no task to execute on cpu.
     /// Handler should do a low priority work.
     /// 
@@ -960,6 +1032,7 @@ public:
 
     void start_epoll();
     void sleep();
+    void maybe_wakeup();
 
     steady_clock_type::duration total_idle_time();
     steady_clock_type::duration total_busy_time();
@@ -998,6 +1071,7 @@ private:
 
     future<> run_exit_tasks();
     void stop();
+    friend class alien::message_queue;
     friend class pollable_fd;
     friend class pollable_fd_state;
     friend class posix_file_impl;
@@ -1091,7 +1165,10 @@ class smp {
     static std::vector<std::function<void ()>> _thread_loops; // for dpdk
     static std::experimental::optional<boost::barrier> _all_event_loops_done;
     static std::vector<reactor*> _reactors;
-    static smp_message_queue** _qs;
+    struct qs_deleter {
+      void operator()(smp_message_queue** qs) const;
+    };
+    static std::unique_ptr<smp_message_queue*[], qs_deleter> _qs;
     static std::thread::id _tmain;
     static bool _using_dpdk;
 
@@ -1165,6 +1242,7 @@ private:
     static void create_thread(std::function<void ()> thread_loop);
 public:
     static unsigned count;
+    static bool poll_mode;
 };
 
 inline
@@ -1298,11 +1376,10 @@ future<size_t> pollable_fd::write_some(net::packet& p) {
             alignof(iovec) == alignof(net::fragment) &&
             sizeof(iovec) == sizeof(net::fragment)
             , "net::fragment and iovec should be equivalent");
-
         iovec* iov = reinterpret_cast<iovec*>(p.fragment_array());
         msghdr mh = {};
         mh.msg_iov = iov;
-        mh.msg_iovlen = p.nr_frags();
+        mh.msg_iovlen = std::min(p.nr_frags(), (unsigned)IOV_MAX);
         auto r = get_file_desc().sendmsg(&mh, MSG_NOSIGNAL);
         if (!r) {
             return write_some(p);
@@ -1489,6 +1566,22 @@ typename timer<Clock>::time_point timer<Clock>::get_timeout() {
 }
 
 extern logger seastar_logger;
+
+class connection_close_exception : public std::exception {
+public:
+    connection_close_exception() {}
+    virtual const char* what() const throw () {
+        return "Remote connection is closed.";
+    }
+};
+
+#define CHECK_CONNECTION_CLOSE(size)              \
+  do {                                            \
+    if (size == 0) {                              \
+      return seastar::make_exception_future<>(    \
+          seastar::connection_close_exception()); \
+    }                                             \
+  } while(0)
 
 }
 

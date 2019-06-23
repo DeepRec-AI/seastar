@@ -70,6 +70,11 @@ future<> output_stream<CharType>::write(scattered_message<CharType> msg) {
 }
 
 template<typename CharType>
+int output_stream<CharType>::get_fd() {
+    return _fd.get_fd();
+}
+
+template<typename CharType>
 future<>
 output_stream<CharType>::zero_copy_put(net::packet p) {
     // if flush is scheduled, disable it, so it will not try to write in parallel
@@ -119,11 +124,19 @@ future<> output_stream<CharType>::write(net::packet p) {
         }
 
         if (_zc_bufs.len() >= _size) {
-            if (_trim_to_size) {
-                return zero_copy_split_and_put(std::move(_zc_bufs));
-            } else {
-                return zero_copy_put(std::move(_zc_bufs));
-            }
+            //if (_trim_to_size) {
+            //    return zero_copy_split_and_put(std::move(_zc_bufs));
+            //} else {
+            //    return zero_copy_put(std::move(_zc_bufs));
+            //}
+            auto bufs = std::move(_zc_bufs);
+            return zero_copy_put(std::move(bufs));
+            //return _lock.write_lock().then([this, bufs = std::move(bufs)] () mutable {
+            //  return zero_copy_put(std::move(bufs)).then([this] () mutable {
+            //    _lock.write_unlock();
+            //    return make_ready_future<>();
+            //  });
+            //});
         }
     }
     return make_ready_future<>();
@@ -147,11 +160,33 @@ input_stream<CharType>::read_exactly_part(size_t n, tmp_buf out, size_t complete
         std::copy(_buf.get(), _buf.get() + now, out.get_write() + completed);
         _buf.trim_front(now);
         completed += now;
+    } else {
+        completed += _fd.get_read_data_size();
+        _fd.reset_read_data_size();
     }
     if (completed == n) {
         return make_ready_future<tmp_buf>(std::move(out));
     }
 
+    char* write_buf = out.get_write() + completed;
+    return _fd.get(n - completed, write_buf)
+              .then([this, n, out = std::move(out), completed] (auto buf) mutable {
+        // connection is disconnect
+        if (_fd.get_read_data_size() == 0) {
+            _eof = true;
+            return make_ready_future<tmp_buf>(std::move(buf));
+        }
+
+        // If buf.size() == 0,
+        // data was read to 'out' directly,
+        // and now, _buf is not available.
+        if (buf.size() > 0) {
+            _buf = std::move(buf);
+        }
+        return this->read_exactly_part(n, std::move(out), completed);
+    });
+
+    /*
     // _buf is now empty
     return _fd.get().then([this, n, out = std::move(out), completed] (auto buf) mutable {
         if (buf.size() == 0) {
@@ -160,7 +195,7 @@ input_stream<CharType>::read_exactly_part(size_t n, tmp_buf out, size_t complete
         }
         _buf = std::move(buf);
         return this->read_exactly_part(n, std::move(out), completed);
-    });
+    });*/
 }
 
 template <typename CharType>
@@ -187,8 +222,48 @@ input_stream<CharType>::read_exactly(size_t n) {
     } else {
         // buffer too small: start copy/read loop
         tmp_buf b(n);
+        _fd.reset_read_data_size();
         return read_exactly_part(n, std::move(b), 0);
     }
+}
+
+// TODO: user_buf should be allocated before read_exactly
+template <typename CharType>
+future<size_t>
+input_stream<CharType>::read_exactly(CharType* user_buf, size_t n) {
+    if (_buf.size() >= n) {
+        std::copy(_buf.get(), _buf.get() + n, user_buf);
+        _buf.trim_front(n);
+        return make_ready_future<size_t>(n);
+    } else {
+        _fd.reset_read_data_size();
+        // wrap to tmp_buf, but the deleter must be empty,
+        // it's owned by user.
+        tmp_buf b(user_buf, n, deleter());
+        return read_exactly_part(n, std::move(b), 0).then([] (auto&& buf) {
+            return make_ready_future<size_t>(buf.size());
+        });
+    }
+}
+
+template <typename CharType>
+future<size_t> input_stream<CharType>::read_exactly_into(CharType* user_buf, size_t n) {
+    static_assert(sizeof(CharType) == 1, "must buffer stream of bytes");
+
+    return _fd.get(user_buf, n).then([this, user_buf, n] (auto size) mutable {
+        // if size == 0, then disconnect
+        if (size == 0) {
+           return make_ready_future<size_t>(0);
+        }
+
+        if (size < n) {
+            return this->read_exactly_into(user_buf + size, n-size).then([size] (auto new_size) {
+                return make_ready_future<size_t>(size + new_size);
+            });
+        }
+
+        return make_ready_future<size_t>(size);
+    });
 }
 
 template <typename CharType>
@@ -394,9 +469,19 @@ output_stream<CharType>::flush() {
                 return _fd.flush();
             });
         } else if (_zc_bufs) {
-            return zero_copy_put(std::move(_zc_bufs)).then([this] {
-                return _fd.flush();
-            });
+            //return zero_copy_put(std::move(_zc_bufs)).then([this] {
+            //    return _fd.flush();
+            //});
+            auto bufs = std::move(_zc_bufs);
+            return zero_copy_put(std::move(bufs)).then([this] () mutable { return _fd.flush(); });
+            //return _lock.write_lock().then([this, bufs = std::move(bufs)] () mutable {
+            //    return zero_copy_put(std::move(bufs)).then([this] () mutable {
+            //      return _fd.flush().then([this] {
+            //        _lock.write_unlock();
+            //        return make_ready_future<>();
+            //      });
+            //    });
+            // });
         }
     } else {
         if (_ex) {
@@ -432,26 +517,60 @@ output_stream<CharType>::put(temporary_buffer<CharType> buf) {
 
 template <typename CharType>
 void
-output_stream<CharType>::poll_flush() {
+output_stream<CharType>::poll_flush(bool one_more_flush) {
     if (!_flush) {
         // flush was canceled, do nothing
         _flushing = false;
-        _in_batch.value().set_value();
-        _in_batch = std::experimental::nullopt;
+        //_in_batch.value().set_value();
+        //_in_batch = std::experimental::nullopt;
+        if (_in_batch) {
+          _in_batch.value().set_value();
+          _in_batch = std::experimental::nullopt;
+        }
         return;
     }
 
     auto f = make_ready_future();
     _flush = false;
-    _flushing = true; // make whoever wants to write into the fd to wait for flush to complete
+    //_flushing = true; // make whoever wants to write into the fd to wait for flush to complete
 
     if (_end) {
         // send whatever is in the buffer right now
         _buf.trim(_end);
         _end = 0;
-        f = _fd.put(std::move(_buf));
+        //f = _fd.put(std::move(_buf));
+        if (one_more_flush) {
+          _flushing = true;
+          f = _fd.put(std::move(_buf));
+        } else {
+          auto bufs = std::move(_buf);
+          _flushing = true;
+          f = _fd.put(std::move(bufs));
+          //f = _lock.write_lock().then([this, bufs = std::move(bufs)] () mutable {
+          //    _flushing = true;
+          //    return _fd.put(std::move(bufs)).then([this] () mutable {
+          //      _lock.write_unlock();
+          //      return make_ready_future<>();
+          //   });
+          //});
+        }
     } else if(_zc_bufs) {
-        f = _fd.put(std::move(_zc_bufs));
+        //f = _fd.put(std::move(_zc_bufs));
+        if (one_more_flush) {
+          _flushing = true;
+          f = _fd.put(std::move(_zc_bufs));
+        } else {
+          auto bufs = std::move(_zc_bufs);
+          _flushing = true;
+          f = _fd.put(std::move(bufs));
+          //f = _lock.write_lock().then([this, bufs = std::move(bufs)] () mutable {
+          //     _flushing = true;
+          //    return _fd.put(std::move(bufs)).then([this] () mutable {
+          //      _lock.write_unlock();
+          //      return make_ready_future<>();
+          //    });
+          //});
+        }
     }
 
     f.then([this] {
@@ -463,7 +582,7 @@ output_stream<CharType>::poll_flush() {
             _ex = std::current_exception();
         }
         // if flush() was called while flushing flush once more
-        poll_flush();
+        poll_flush(true);
     });
 }
 

@@ -278,6 +278,30 @@ posix_ap_server_socket_impl<Transport>::move_connected_socket(socket_address sa,
     }
 }
 
+// 'hint' is the total bytes we need, if the 'hint' is
+// greater or equal to '_buf_size', we can read the data
+// to 'user_buf' directly from kernel. And if the last
+// several bytes less than '_buf_size', we must read the
+// data to '_buf'.
+future<temporary_buffer<char>>
+posix_data_source_impl::get(size_t hint, char* user_buf) {
+    if (hint >= _buf_size) {
+        return _fd->read_some(user_buf, hint).then([this] (size_t size) {
+            _buf.trim(0);
+            _read_data_size = size;
+            return make_ready_future<temporary_buffer<char>>(std::move(temporary_buffer<char>()));
+        });
+    } else {
+        return _fd->read_some(_buf.get_write(), _buf_size).then([this] (size_t size) {
+            _buf.trim(size);
+            auto ret = std::move(_buf);
+            _buf = temporary_buffer<char>(_buf_size);
+            _read_data_size = size;
+            return make_ready_future<temporary_buffer<char>>(std::move(ret));
+        });
+    }
+}
+
 future<temporary_buffer<char>>
 posix_data_source_impl::get() {
     return _fd->read_some(_buf.get_write(), _buf_size).then([this] (size_t size) {
@@ -285,6 +309,13 @@ posix_data_source_impl::get() {
         auto ret = std::move(_buf);
         _buf = temporary_buffer<char>(_buf_size);
         return make_ready_future<temporary_buffer<char>>(std::move(ret));
+    });
+}
+
+future<size_t>
+posix_data_source_impl::get(char* user_buf, size_t n) {
+    return _fd->read_some(user_buf, n).then([this] (size_t size) {
+        return make_ready_future<size_t>(size);
     });
 }
 
@@ -326,6 +357,11 @@ future<>
 posix_data_sink_impl::close() {
     _fd->shutdown(SHUT_WR);
     return make_ready_future<>();
+}
+
+int
+posix_data_sink_impl::get_fd() {
+    return _fd->get_fd();
 }
 
 server_socket

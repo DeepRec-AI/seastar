@@ -408,6 +408,8 @@ public:
 inline
 void throw_system_error_on(bool condition, const char* what_arg) {
     if (condition) {
+        std::cerr << "seastar throw system errno:" << errno
+                  << ", details:" << what_arg << std::endl;
         throw std::system_error(errno, std::system_category(), what_arg);
     }
 }
@@ -417,6 +419,7 @@ inline
 void throw_kernel_error(T r) {
     static_assert(std::is_signed<T>::value, "kernel error variables must be signed");
     if (r < 0) {
+        std::cerr << "seastar throw kernel error:" << std::endl;
         throw std::system_error(-r, std::system_category());
     }
 }
@@ -425,6 +428,7 @@ template <typename T>
 inline
 void throw_pthread_error(T r) {
     if (r != 0) {
+        std::cerr << "seastar throw thread errno:" << std::endl;
         throw std::system_error(r, std::system_category());
     }
 }

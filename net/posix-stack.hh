@@ -100,9 +100,12 @@ class posix_data_source_impl final : public data_source_impl {
     temporary_buffer<char> _buf;
     size_t _buf_size;
 public:
+    //TODO increase 8192
     explicit posix_data_source_impl(lw_shared_ptr<pollable_fd> fd, size_t buf_size = 8192)
         : _fd(std::move(fd)), _buf(buf_size), _buf_size(buf_size) {}
     future<temporary_buffer<char>> get() override;
+    future<size_t> get(char* user_buf, size_t n) override;
+    future<temporary_buffer<char>> get(size_t hint, char* user_buf) override;
     future<> close() override;
 };
 
@@ -114,6 +117,7 @@ public:
     future<> put(packet p) override;
     future<> put(temporary_buffer<char> buf) override;
     future<> close() override;
+    int get_fd() override;
 };
 
 template <transport Transport>

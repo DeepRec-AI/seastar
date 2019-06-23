@@ -148,6 +148,12 @@ public:
             return get();
         });
     }
+
+    virtual future<size_t> get(char* user_buf, size_t n) override {
+        // not impl
+        return make_ready_future<size_t>(0);
+    }
+
     future<> close() override {
         _conn->close_write();
         return make_ready_future<>();
