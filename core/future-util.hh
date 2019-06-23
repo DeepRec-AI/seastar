@@ -74,7 +74,7 @@ template <typename Func, typename... Args>
 inline
 auto
 with_scheduling_group(scheduling_group sg, Func func, Args&&... args) {
-    using return_type = decltype(func(std::forward<Args>(args)...));
+    using return_type = std::result_of_t<Func(Args...)>;
     using futurator = futurize<return_type>;
     if (sg.active()) {
         return futurator::apply(func, std::forward<Args>(args)...);
