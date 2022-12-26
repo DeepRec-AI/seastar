@@ -86,7 +86,10 @@
 #include "util/backtrace.hh"
 #include "util/spinlock.hh"
 #include "util/print_safe.hh"
+
+#ifdef HAVE_SDT
 #include <sys/sdt.h>
+#endif
 
 #ifdef HAVE_OSV
 #include <osv/newpoll.hh>
@@ -2433,10 +2436,14 @@ void reactor::run_tasks(task_queue& tq) {
     while (!tasks.empty()) {
         auto tsk = std::move(tasks.front());
         tasks.pop_front();
+#ifdef HAVE_SDT
         STAP_PROBE(seastar, reactor_run_tasks_single_start);
+#endif
         tsk->run();
         tsk.reset();
+#ifdef HAVE_SDT
         STAP_PROBE(seastar, reactor_run_tasks_single_end);
+#endif
         ++tq._tasks_processed;
         // check at end of loop, to allow at least one task to run
         if (need_preempt() && tasks.size() <= _max_task_backlog) {
@@ -2900,7 +2907,9 @@ reactor::run_some_tasks(sched_clock::time_point& t_run_completed) {
     }
     sched_print("run_some_tasks: start");
     g_need_preempt = false;
+#ifdef HAVE_SDT
     STAP_PROBE(seastar, reactor_run_tasks_start);
+#endif
     do {
         auto t_run_started = t_run_completed;
         insert_activating_task_queues();
@@ -2922,7 +2931,9 @@ reactor::run_some_tasks(sched_clock::time_point& t_run_completed) {
             tq->_active = false;
         }
     } while (have_more_tasks() && !need_preempt());
+#ifdef HAVE_SDT
     STAP_PROBE(seastar, reactor_run_tasks_end);
+#endif
     *internal::current_scheduling_group_ptr() = default_scheduling_group(); // Prevent inheritance from last group run
     sched_print("run_some_tasks: end");
 }
