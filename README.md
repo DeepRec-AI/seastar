@@ -1,48 +1,22 @@
-Seastar
-=======
+# SeaStar
 
-Introduction
-------------
+## Introduction
 
 SeaStar is an event-driven framework allowing you to write non-blocking,
 asynchronous code in a relatively straightforward manner (once understood).
 It is based on [futures](http://en.wikipedia.org/wiki/Futures_and_promises).
 
-Building Seastar
---------------------
+SeaStar is used in GRPC++ and StarServer protocols in DeepRec. New features in SeaStar:
+-   Add seastar::packet_queue & seastar::channel to pass packets to seastar threads.
+-   Support read_exactly read into buffer which allocate by user.
+-   Disable seastar signals logic which would affect TensorFlow's behavior.
+-   Support disconnection handling when send/recv errors happen.
 
-See instructions for [Fedora](doc/building-fedora.md), [CentOS](doc/building-centos.md) and [Ubuntu](doc/building-ubuntu.md).
+## Building SeaStar
 
-There are also instructions for building on any host that supports [Docker](doc/building-docker.md).
+SeaStar is built as a third-party source code in DeepRec. By default, SeaStar is enabled in DeepRec.
 
-Use of the [DPDK](http://dpdk.org) is [optional](doc/building-dpdk.md).
+More features built on SeaStar:
 
-Getting started
----------------
-
-There is a [mini tutorial](doc/mini-tutorial.md) and a [more comprehensive one](doc/tutorial.md).
-
-The documentation is available on the [web](http://docs.seastar-project.org/).
-
-The Native TCP/IP Stack
------------------------
-
-Seastar comes with its own [userspace TCP/IP stack](doc/native-stack.md) for better performance.
-
-Recommended hardware configuration for SeaStar
-----------------------------------------------
-
-* CPUs - As much as you need. SeaStar is highly friendly for multi-core and NUMA
-* NICs - As fast as possible, we recommend 10G or 40G cards. It's possible to use
-       1G too but you may be limited by their capacity.
-       In addition, the more hardware queue per cpu the better for SeaStar.
-       Otherwise we have to emulate that in software.
-* Disks - Fast SSDs with high number of IOPS.
-* Client machines - Usually a single client machine can't load our servers.
-       Both memaslap (memcached) and WRK (httpd) cannot over load their matching
-       server counter parts. We recommend running the client on different machine
-       than the servers and use several of them.
-
-Build status
-------------
-On Travis CI: [![Travis Build Status](https://travis-ci.org/scylladb/seastar.svg?branch=master)](https://travis-ci.org/scylladb/seastar)
+* [GRPC++](https://github.com/DeepRec-AI/DeepRec/blob/main/docs/docs_en/GRPC%2B%2B.md)
+* [StarServer](https://github.com/DeepRec-AI/DeepRec/blob/main/docs/docs_en/StarServer.md)
